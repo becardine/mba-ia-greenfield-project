@@ -28,6 +28,11 @@ export function createTestDataSource(
 }
 
 export async function cleanAllTables(dataSource: DataSource): Promise<void> {
+  // Suites that synchronize only auth/user entities never create "videos"
+  const [{ videos }] = await dataSource.query<{ videos: string | null }[]>(
+    `SELECT to_regclass('public.videos') AS videos`,
+  );
+  if (videos) await dataSource.query('DELETE FROM "videos"');
   await dataSource.query('DELETE FROM "refresh_tokens"');
   await dataSource.query('DELETE FROM "verification_tokens"');
   await dataSource.query('DELETE FROM "channels"');
