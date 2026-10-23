@@ -43,11 +43,11 @@ O projeto é um monorepo baseado em containers Docker. Cada subprojeto sobe sua 
 
 - **Frontend** (Next.js 16, App Router + React Server Components) — interface da plataforma. Segue o **modelo BFF**: o navegador nunca chama a API NestJS diretamente; todo tráfego passa por Route Handlers same-origin em `app/api/**`, que fazem proxy server-side para a API.
 - **API** (NestJS 11) — regras de negócio, autenticação (JWT + refresh token rotation), envio de e-mails e acesso ao banco.
-- **Database** (PostgreSQL 17) — usuários, canais e tokens de autenticação.
+- **Database** (PostgreSQL 17) — usuários, canais, tokens de autenticação e vídeos.
 - **Email Service** (Mailpit) — captura os e-mails transacionais (confirmação de conta e recuperação de senha) em uma UI local.
-- **Video Worker** (FFmpeg) — processamento de vídeos *(planejado — Fase 03)*.
-- **Object Storage** (S3/MinIO) — arquivos de vídeo e thumbnails *(planejado — Fase 03)*.
-- **Message Queue** — fila de processamento de vídeos *(planejado — Fase 03)*.
+- **Video Worker** (NestJS + FFmpeg, serviço `video-worker`) — consome a fila, extrai duração/metadados com `ffprobe` e gera a thumbnail com `ffmpeg`.
+- **Object Storage** (MinIO localmente, S3 em produção) — arquivos de vídeo e thumbnails. Upload multipart e streaming vão direto do cliente ao storage via URLs pré-assinadas.
+- **Message Queue** (BullMQ + Redis) — fila `video-processing` com retries e backoff exponencial.
 
 O diagrama de arquitetura completo (C4) está em `docs/diagrams/software-arch.mermaid`.
 
@@ -69,9 +69,14 @@ docker compose exec nestjs-api npm install
 # Cria o schema do banco (obrigatório — synchronize está desabilitado)
 docker compose exec nestjs-api npm run migration:run
 
+# O video-worker sobe junto, mas depende do node_modules instalado acima
+docker compose restart video-worker
+
 # Sobe o servidor de desenvolvimento em watch mode
 docker compose exec -d nestjs-api npm run start:dev
 ```
+
+> A imagem de desenvolvimento inclui o FFmpeg. Ao atualizar de uma versão anterior, reconstrua-a com `docker compose up -d --build`.
 
 Serviços disponíveis:
 
@@ -80,6 +85,9 @@ Serviços disponíveis:
 | API NestJS | http://localhost:3000 |
 | PostgreSQL | `localhost:5432` (db/user/senha: `streamtube`) |
 | Mailpit (UI de e-mails) | http://localhost:8025 |
+| MinIO (API S3 / console) | http://localhost:9000 / http://localhost:9001 (user `streamtube`, senha `streamtube-secret`) |
+| Redis (fila BullMQ) | `localhost:6379` |
+| Video Worker | sem porta — logs em `docker compose logs -f video-worker` |
 | Swagger (opcional) | http://localhost:3000/api/docs — habilite com `SWAGGER_ENABLED=true` |
 
 ### 2. Frontend (Next.js)
