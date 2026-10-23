@@ -13,6 +13,10 @@ docker compose ps   # all services must show status "running"
 Then verify each infrastructure service is actually ready to accept connections — not just running:
 
 - **PostgreSQL:** `docker compose exec db pg_isready -U streamtube` — expect `accepting connections`
+- **MinIO:** `docker compose exec minio mc ready local` — expect `The cluster is ready`
+- **Redis:** `docker compose exec redis redis-cli ping` — expect `PONG`
+
+`docker compose up -d` also starts `video-worker` (a queue consumer, not an HTTP server). It runs `npm run start:worker` from the mounted source, so after a fresh `npm install` restart it: `docker compose restart video-worker`.
 
 Only start the NestJS dev server (`npm run start:dev`) when the user **explicitly** asks to run the application — never as part of "start the environment".
 
@@ -32,8 +36,14 @@ docker compose exec nestjs-api npm run start:dev
 ```
 
 Services:
-- `nestjs-api` — NestJS API, port `3000`
+- `nestjs-api` — NestJS API, port `3000` (image `Dockerfile.dev`, includes FFmpeg)
+- `video-worker` — same image and source, runs `npm run start:worker` (BullMQ consumer, no port)
 - `db` — PostgreSQL 17, port `5432`, database `streamtube`, user/password `streamtube`
+- `mailpit` — SMTP capture, ports `1025` (SMTP) / `8025` (UI)
+- `minio` — S3-compatible object storage, ports `9000` (API) / `9001` (console), user `streamtube` / `streamtube-secret`; buckets `videos` and `thumbnails` are created on boot by `StorageService`
+- `redis` — BullMQ backend, port `6379`
+
+The MinIO image is pinned to `minio/minio:RELEASE.2024-12-18T13-15-44Z`: MinIO no longer publishes community images to Docker Hub/quay, so that tag only resolves where it is already cached.
 
 All verification and teardown commands run on the **host machine**:
 
@@ -60,8 +70,10 @@ docker compose down
 
 ```bash
 npm run start:dev                        # Dev server with hot-reload
-npm run build                            # Compile to dist/
+npm run build                            # Compile to dist/ (API and worker entrypoints)
 npm run start:prod                       # Run compiled build
+npm run start:worker                     # Video worker via ts-node (what the video-worker service runs)
+npm run start:worker:prod                # Compiled video worker (dist/worker)
 
 npm test                                 # Unit tests
 npm run test:watch                       # Unit tests in watch mode
@@ -93,6 +105,11 @@ docker compose exec nestjs-api npm run test:e2e   # already configured
 
 Parallel execution causes FK violations, deadlocks, and cross-suite contamination because suites truncate or seed shared tables concurrently.
 
+Video tests use the real `minio`, `redis` and FFmpeg (fixtures are generated at test time by `src/test/video-fixture.ts` — no binary fixtures in the repo), so those services must be up. `src/test/test-env.setup.ts` (a Jest `setupFiles` entry) isolates them from the dev stack:
+
+- `QUEUE_PREFIX=streamtube-test` — a running `video-worker` (prefix `bull`) never consumes the jobs tests assert on; the delivery e2e starts its own in-process `WorkerModule`.
+- `S3_PUBLIC_ENDPOINT=$S3_ENDPOINT` — `localhost:9000` is unreachable from inside the container, so presigned client URLs are signed for `minio:9000` during tests.
+
 During active development, run only the tests related to the file being changed (`npm test -- path/to/file.spec.ts`). Before declaring a task done, run the full suite — see the global `CLAUDE.md` → "Definition of Done (Technical)".
 
 ## Long-running Processes
@@ -119,7 +136,7 @@ Conventions for **how to write** each kind of test (mocking patterns, AAA struct
 
 These settings are required in `package.json` (jest config) and `test/jest-e2e.json` for the project's tests to work correctly:
 
-- `setupFiles: ["dotenv/config"]` — without this, `.env` is not loaded inside the Jest process. `DB_HOST`, `JWT_SECRET`, etc. fall back to undefined or to the host's `localhost`, breaking container-to-container DNS.
+- `setupFiles: ["dotenv/config", ".../src/test/test-env.setup.ts"]` — without `dotenv/config`, `.env` is not loaded inside the Jest process (`DB_HOST`, `JWT_SECRET`, etc. fall back to undefined or to the host's `localhost`, breaking container-to-container DNS). The second file applies the test-only overrides described under "Test execution"; it must run after `dotenv/config`.
 - `testRegex: '.*\\.(spec|integration-spec)\\.ts$'` — covers both unit (`*.spec.ts`) and integration (`*.integration-spec.ts`) suffixes.
 
 Do not add new test-file suffixes; if a new test type is needed, update the regex deliberately.
@@ -148,6 +165,22 @@ NestJS with standard module structure. Source lives in `src/`, compiled output i
 
 - Each domain feature gets its own module (e.g., `UsersModule`, `VideosModule`) registered in `AppModule`
 - Controllers handle HTTP routing; Services hold business logic; both are scoped to their module
+
+### Two runtimes, one codebase
+
+- **HTTP API** — `src/main.ts` → `AppModule`.
+- **Video worker** — `src/worker.ts` → `WorkerModule` (`NestFactory.createApplicationContext`, no HTTP). Only the worker registers the `@Processor` (`src/worker/video.processor.ts`); the API only produces jobs.
+- Both share `AppConfigModule` (global, Joi-validated config), `DatabaseModule` (TypeORM connection) and `QueueModule` (BullMQ Redis connection + `QUEUE_PREFIX`).
+
+### Videos (Fase 03)
+
+- `src/videos/` — `Video` entity (`videos` table, status `draft → processing → ready | failed`), `VideosService`, `VideosController`, producer `VideoProcessingQueue` (queue `video-processing`, job `process-video`, `jobId = videoId`, 3 attempts with exponential backoff).
+- `src/storage/` — `StorageService`: the only code that talks to S3/MinIO. Two clients: internal (`S3_ENDPOINT`) for server calls, public (`S3_PUBLIC_ENDPOINT`) only to sign URLs handed to clients. Flexible checksums are set to `WHEN_REQUIRED` so presigned `UploadPart` URLs stay usable by browsers.
+- `src/media/` — `MediaProbeService`: spawns the system `ffprobe`/`ffmpeg` directly over a presigned URL (no temp copy of up to 10GB).
+- Upload flow: `POST /videos` (draft + multipart + part URLs) → client PUTs parts to storage → `POST /videos/:id/upload/complete` (ListParts size check, then complete + enqueue). Resume: `GET /videos/:id/upload`, `POST /videos/:id/upload/parts`. Abort: `DELETE /videos/:id/upload`.
+- Delivery: `GET /videos/:shortId/{stream,download,thumbnail}` are `@Public()` and answer `302` to presigned URLs (`S3_DELIVERY_URL_TTL`); storage serves `206` ranges. Non-`ready` videos are `404` for everyone; owners follow progress via `GET /videos/:id`.
+- Env vars: `S3_ENDPOINT`, `S3_PUBLIC_ENDPOINT`, `S3_REGION`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_VIDEOS_BUCKET`, `S3_THUMBNAILS_BUCKET`, `S3_UPLOAD_URL_TTL`, `S3_DELIVERY_URL_TTL`, `REDIS_HOST`, `REDIS_PORT`, `QUEUE_PREFIX` (see `.env.example`).
+- `@nestjs/bullmq` is pinned to 11.x: 12.x ships ESM-only and cannot be loaded by this CommonJS build/Jest setup. `ioredis` is a direct dependency because bullmq 6 treats it as an optional peer.
 
 ## Code Conventions
 
