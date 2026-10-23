@@ -14,6 +14,11 @@ const MANAGED_TABLES = [
   'verification_tokens',
 ];
 
+// Enum types created by the migrations. Suites using synchronize:true (or a
+// previous `migration:run`) may leave them behind after the tables are dropped,
+// which would make `CREATE TYPE` fail when the migrations are re-applied.
+const MANAGED_ENUM_TYPES = ['verification_tokens_type_enum'];
+
 describe('Database migrations (integration)', () => {
   let dataSource: DataSource;
 
@@ -37,6 +42,11 @@ describe('Database migrations (integration)', () => {
       ),
       dataSource.query(`DROP TABLE IF EXISTS "migrations" CASCADE`),
     ]);
+    await Promise.all(
+      MANAGED_ENUM_TYPES.map((type) =>
+        dataSource.query(`DROP TYPE IF EXISTS "public"."${type}" CASCADE`),
+      ),
+    );
   });
 
   afterAll(async () => {
